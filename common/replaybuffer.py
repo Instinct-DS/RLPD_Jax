@@ -68,7 +68,7 @@ class ReplayBuffer:
                     next_observations = self.next_observations[idx],
                     terminations = self.terminations[idx],
                     truncations = self.truncations[idx],
-                    masks = 1.0 - self.terminations
+                    masks = 1.0 - self.terminations[idx]
                 )
 
                 yield batch
