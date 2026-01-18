@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+import numpy as np
 from functools import partial
 import flax.linen as nn
 import optax
@@ -28,37 +29,32 @@ class AlphaModule(nn.Module):
         log_alpha = self.param('log_alpha', lambda key: jnp.zeros((1,)))
         return log_alpha
     
-import numpy as np
-
-def combine_dicts(a: dict, b: dict) -> dict:
+def interleave_dicts(a: dict, b: dict) -> dict:
     """
-    Combines two dictionaries by concatenating arrays along axis 0.
-    Result = [a_data, b_data] (stacked vertically).
-    The output arrays are converted to JAX arrays (jnp).
+    Combines two dictionaries by interleaving arrays along axis 0.
+    Returns Numpy arrays (JAX will convert them on device transfer).
     """
     combined = {}
-
     for k, va in a.items():
-        # Check if key exists in b
-        if k not in b:
-            raise KeyError(f"Key '{k}' found in first dict but not in second.")
-            
         vb = b[k]
-
-        # 1. Recursive step for nested dictionaries
         if isinstance(va, dict):
-            combined[k] = combine_dicts(va, vb)
+            combined[k] = interleave_dicts(va, vb)
             continue
-
-        # 2. Concatenation using JAX
-        # jnp.concatenate accepts numpy arrays or lists and returns a JAX DeviceArray
-        try:
-            combined[k] = jnp.concatenate([va, vb], axis=0)
-        except ValueError as e:
-            # Add context to the error if shapes don't align
-            raise ValueError(f"Shape mismatch for key '{k}': {va.shape} vs {vb.shape}") from e
-
+            
+        # Efficient Numpy Interleaving
+        len_a, len_b = va.shape[0], vb.shape[0]
+        out_shape = (len_a + len_b, *va.shape[1:])
+        out = np.empty(out_shape, dtype=va.dtype)
+        
+        if len_a == len_b:
+            out[0::2] = va
+            out[1::2] = vb
+        else:
+            out = np.concatenate([va, vb], axis=0)
+            
+        combined[k] = out # Return numpy array
     return combined
+
 
 
 class SACPDAgent:
@@ -165,8 +161,8 @@ class SACPDAgent:
         )
 
         # Replay Buffers
-        self.replay_buffer = ReplayBuffer(state_dim, action_dim, buffer_size, batch_size, gamma, n_envs)
-        self.replay_buffer_demo = ReplayBuffer(state_dim, action_dim, buffer_size, int(batch_size*self.per_batch_demo), gamma, 1)
+        self.replay_buffer = ReplayBuffer(state_dim, action_dim, buffer_size, int(batch_size*self.gradient_steps), gamma, n_envs)
+        self.replay_buffer_demo = ReplayBuffer(state_dim, action_dim, buffer_size, int(batch_size*self.gradient_steps*self.per_batch_demo), gamma, 1)
 
         # Logger
         if logger_name == "mlflow":
@@ -179,17 +175,28 @@ class SACPDAgent:
             "n_critics": n_critics, "m_critics": m_critics, "seed": seed
         }
 
+
+    @staticmethod
+    @partial(jax.jit, static_argnames="apply_fn")
+    def _sample_action(apply_fn, params, obs, key):
+        actions = apply_fn(params, obs, key, method=TanhGaussianPolicy.sample_without_probs)
+        return actions
+    
+    @staticmethod
+    @partial(jax.jit, static_argnames="apply_fn")
+    def _sample_action_det(apply_fn, params, obs):
+        actions = apply_fn(params, obs, method=TanhGaussianPolicy.sample_det)
+        return actions
+
     def select_action(self, state, deterministic=True):
         state = jnp.array(state)
-        # Add batch dim if missing
-        if state.ndim == 1:
-            state = state[None, ...]
-            
+        if state.ndim == 1: state = state[None, ...]
+        
         if deterministic:
-            action, _ = self.actor_def.apply(self.actor_state.params, state, method=self.actor_def.sample_det)
+            action = SACPDAgent._sample_action_det(self.actor_state.apply_fn, self.actor_state.params, state)
         else:
             self.rng, key = jax.random.split(self.rng)
-            action, _ = self.actor_def.apply(self.actor_state.params, state, key, method=self.actor_def.sample)
+            action = SACPDAgent._sample_action(self.actor_state.apply_fn, self.actor_state.params, state, key)
             
         return np.array(action)
     
@@ -197,9 +204,10 @@ class SACPDAgent:
         load_demo_trajectories_parallel([self.replay_buffer_demo], demo_file, demo_env, nds, nds_name, self.gamma, n_load=n_load)
         return self.replay_buffer_demo
     
+    #  Single Step Updates #
     @staticmethod
-    @partial(jax.jit, static_argnames=("n_critics", "m_critics"))
-    def update_critic(
+    # @partial(jax.jit, static_argnames=("n_critics", "m_critics"))
+    def _update_critic_step(
         critics_state, target_critics_params, actor_state, alpha_state,
         batch, rng,
         gamma, n_critics, m_critics
@@ -249,8 +257,8 @@ class SACPDAgent:
         return new_critics_state, critic_loss
     
     @staticmethod
-    @jax.jit
-    def update_actor_and_alpha(
+    # @jax.jit
+    def _update_actor_and_alpha_step(
         actor_state, critics_state, alpha_state,
         batch, rng,
         target_entropy
@@ -292,7 +300,57 @@ class SACPDAgent:
         
         return new_actor_state, new_alpha_state, actor_loss, alpha_loss, alpha
     
-    def train(self, env, total_training_steps=1_000_000, learning_starts=2_000, progress_bar=True, verbose=1, log_interval=5, log_interval_metrics=500, callback=None):
+    # Fused Update
+    @staticmethod
+    @partial(jax.jit, static_argnames=("gradient_steps", "n_critics", "m_critics", "policy_delay_update"))
+    def batch_update(
+        actor_state, critics_state, target_critics_params, alpha_state,
+        batch, rng,
+        gamma, tau, target_entropy,
+        gradient_steps, n_critics, m_critics, policy_delay_update
+    ):
+        """
+        Unrolled update loop for maximum speed.
+        Assumes batch is shape (gradient_steps * batch_size, ...).
+        """
+        
+        # Helper to slice the big batch into micro-batches
+        def get_slice(x, i):
+            step_size = x.shape[0] // gradient_steps
+            return jax.lax.dynamic_slice_in_dim(x, i * step_size, step_size, axis=0)
+
+        # We manually unroll the loop using Python `for`
+        # This creates a larger computation graph but allows XLA to optimize across steps
+        # and avoids the overhead of lax.scan for small N (N < 50).
+        
+        # We need to track the LAST metrics for logging
+        last_metrics = {} 
+
+        for i in range(gradient_steps):
+            rng, r_critic, r_actor = jax.random.split(rng, 3)
+            
+            # 1. Slice Batch
+            step_batch = jax.tree_util.tree_map(lambda x: get_slice(x, i), batch)
+            
+            # 2. Update Critic
+            critics_state, c_loss = SACPDAgent._update_critic_step(
+                critics_state, target_critics_params, actor_state, alpha_state, step_batch, r_critic, gamma, n_critics, m_critics
+            )
+                
+            # Soft Update Targets
+            target_critics_params = optax.incremental_update(critics_state.params, target_critics_params, tau)
+            
+        actor_state, alpha_state, a_loss, al_loss, curr_alpha = SACPDAgent._update_actor_and_alpha_step(
+            actor_state, critics_state, alpha_state, step_batch, r_actor, target_entropy
+        )
+
+        last_metrics = {
+            "critic_loss": c_loss, "actor_loss": a_loss, "alpha_loss": al_loss, "alpha": curr_alpha
+        }
+
+        return actor_state, critics_state, target_critics_params, alpha_state, last_metrics
+    
+    def train(self, env, total_training_steps=1_000_000, learning_starts=2_000, progress_bar=True, verbose=1, log_interval=5, log_interval_metrics=5000, callback=None):
         self.total_training_steps = total_training_steps
         self.learning_starts = learning_starts
         
@@ -337,53 +395,26 @@ class SACPDAgent:
 
             # Update Step
             if self._total_timesteps_ran >= learning_starts and self._total_timesteps_ran % self.train_freq == 0:
-                for _ in range(self.gradient_steps):
-                    self._count_total_gradients_taken += 1
-                    
-                    # Sample Buffers
-                    batch = self.replay_buffer.sample()
-                    batch_demo = self.replay_buffer_demo.sample()
+                # Sample Buffers
+                batch = self.replay_buffer.sample()
+                batch_demo = self.replay_buffer_demo.sample()
 
-                    # Combine & Cast to JAX Arrays
-                    combined_batch = combine_dicts(batch, batch_demo)
+                # Combine & Cast to JAX Arrays
+                combined_batch = interleave_dicts(batch, batch_demo)
 
-                    # Update
-                    self.rng, rng_critic, rng_actor = jax.random.split(self.rng, 3)
+                # Update
+                self.rng, update_key = jax.random.split(self.rng)
+                
+                self.rng, key = jax.random.split(self.rng)
+                (self.actor_state, self.critics_state, self.target_critics_params, self.alpha_state, metrics) = \
+                SACPDAgent.batch_update(
+                    self.actor_state, self.critics_state, self.target_critics_params, self.alpha_state,
+                    combined_batch, update_key,
+                    self.gamma, self.tau, self.target_entropy,
+                    self.gradient_steps, self.n_critics, self.m_critics, self.policy_delay_update
+                )
 
-                    # 1. Update Critics
-                    self.critics_state, critic_loss = self.update_critic(
-                        self.critics_state, self.target_critics_params, self.actor_state, self.alpha_state,
-                        combined_batch, rng_critic,
-                        self.gamma, self.n_critics, self.m_critics
-                    )
-
-                    # 2. Delayed Actor Update logic
-                    if self._count_total_gradients_taken % self.policy_delay_update == 0:
-                        # Update Actor & Alpha
-                        self.actor_state, self.alpha_state, actor_loss, alpha_loss, current_alpha = self.update_actor_and_alpha(
-                            self.actor_state, self.critics_state, self.alpha_state,
-                            combined_batch, rng_actor,
-                            self.target_entropy
-                        )
-
-                        # Store metrics for logging
-                        metrics = {
-                            "actor_loss": actor_loss,
-                            "critic_loss": critic_loss,
-                            "alpha_loss": alpha_loss,
-                            "alpha": current_alpha
-                        }
-                    else:
-                        # If we skipped actor update, we still need to record critic loss
-                        # We can either reuse old metrics or just log critic_loss
-                        metrics = {"critic_loss": critic_loss, "actor_loss": 0.0, "alpha_loss": 0.0, "alpha": 0.0}
-                    
-                    # Soft Update Targets
-                    if self._count_total_gradients_taken % self.target_update_interval == 0:
-                        self.target_critics_params = optax.incremental_update(
-                            self.critics_state.params, self.target_critics_params, step_size=self.tau
-                        )
-                    
+                self._count_total_gradients_taken += self.gradient_steps                    
 
             # Logging
             if self._total_timesteps_ran >= learning_starts and self.logger_count % log_interval == 0:
@@ -404,7 +435,7 @@ class SACPDAgent:
                 
                 self.logger_count = 1
 
-            if self._total_timesteps_ran >= learning_starts and self._total_timesteps_ran % log_interval_metrics == 0:
+            if self._total_timesteps_ran >= learning_starts and self._count_total_gradients_taken % log_interval_metrics == 0:
                 self.logger.log_metric("training/actor_loss", metrics['actor_loss'].item(), step=self._total_timesteps_ran)
                 self.logger.log_metric("training/critic_loss", metrics['critic_loss'].item(), step=self._total_timesteps_ran)
                 self.logger.log_metric("training/alpha_loss", metrics['alpha_loss'].item(), step=self._total_timesteps_ran)

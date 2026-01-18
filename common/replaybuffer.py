@@ -38,8 +38,8 @@ class ReplayBuffer:
     def sample(self, size = None):
         if size is None:
             size = self.size
-        # idx = np.random.randint(0, size, size=self.batch_size)
-        idx = np.random.permutation(size)[:self.batch_size]
+        idx = np.random.randint(0, size, size=self.batch_size)
+        # idx = np.random.permutation(size)[:self.batch_size]
         batch = dict(
             observations = self.observations[idx],
             actions = self.actions[idx],

@@ -65,21 +65,25 @@ class TanhGaussianPolicy(nn.Module):
         log_prob = log_prob_gauss - log_det_jac
         
         return action, log_prob
+    
+    def sample_without_probs(self, state, rng):
+        mu, log_std = self.__call__(state)
+        std = jnp.exp(log_std)
+        
+        # Reparameterization trick
+        eps = jax.random.normal(rng, shape=mu.shape)
+        action_pre = mu + std * eps
+        
+        action = jnp.tanh(action_pre)
+        
+        return action
 
     def sample_det(self, state):
         mu, log_std = self.__call__(state)
         action_pre = mu
         action = jnp.tanh(action_pre)
-        
-        # Calculate log prob even for deterministic (though often not needed)
-        std = jnp.exp(log_std)
-        log_prob_gauss = -0.5 * (((action_pre - mu) / (std + 1e-6)) ** 2 + 2 * log_std + jnp.log(2 * jnp.pi))
-        log_prob_gauss = jnp.sum(log_prob_gauss, axis=-1)
-        
-        log_det_jac = jnp.sum(jnp.log(1 - action**2 + 1e-6), axis=-1)
-        log_prob = log_prob_gauss - log_det_jac
-        
-        return action, log_prob
+    
+        return action
 
     def log_probs(self, state, action):
         action_pre = atanh(action)
